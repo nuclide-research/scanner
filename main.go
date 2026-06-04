@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,7 +20,15 @@ func main() {
 	ipsFile := flag.String("ips-file", "", "File containing IPs to scan, one per line (skips # comments)")
 	workers := flag.Int("workers", 100, "Number of concurrent workers")
 	outputFile := flag.String("output", "scan_results.jsonl", "Output file for results")
+	portsFlag := flag.String("ports", "80,443,22,3306,5432,3389,8000,8080,8081,8123,9000,9042,9200,10000,27017,5984",
+		"comma-separated ports to scan (defaults cover web + common data layers)")
 	flag.Parse()
+
+	ports := parsePorts(*portsFlag)
+	if len(ports) == 0 {
+		fmt.Fprintln(os.Stderr, "no valid ports in --ports")
+		os.Exit(1)
+	}
 
 	// Initialize components
 	bloomFilter := NewBloomFilter(256_000_000, 0.02)
@@ -48,7 +57,7 @@ func main() {
 
 	for i := 0; i < *workers; i++ {
 		wg.Add(1)
-		go worker(ctx, &wg, i, ipChan, bloomFilter, casDedup, indexer, stats, &statsLock)
+		go worker(ctx, &wg, i, ipChan, bloomFilter, casDedup, indexer, stats, &statsLock, ports)
 	}
 
 	// Print stats every 5 seconds
@@ -83,10 +92,9 @@ type ScanStats struct {
 	Deduped      uint64
 }
 
-func worker(ctx context.Context, wg *sync.WaitGroup, id int, ipChan chan string, bloom *BloomFilter, dedup *CASDedup, indexer *Indexer, stats *ScanStats, lock *sync.Mutex) {
+func worker(ctx context.Context, wg *sync.WaitGroup, id int, ipChan chan string, bloom *BloomFilter, dedup *CASDedup, indexer *Indexer, stats *ScanStats, lock *sync.Mutex, ports []int) {
 	defer wg.Done()
 
-	ports := []int{80, 443, 22, 3306, 5432, 3389, 8000, 8080, 8081, 27017, 9200, 5984}
 	timeout := 3 * time.Second
 
 	for ip := range ipChan {
@@ -130,6 +138,22 @@ func worker(ctx context.Context, wg *sync.WaitGroup, id int, ipChan chan string,
 			}
 		}
 	}
+}
+
+// parsePorts turns a comma-separated port list into ints, trimming spaces and
+// skipping empty or non-numeric entries.
+func parsePorts(s string) []int {
+	var ports []int
+	for _, p := range strings.Split(s, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if n, err := strconv.Atoi(p); err == nil {
+			ports = append(ports, n)
+		}
+	}
+	return ports
 }
 
 func generateIPRange(startIP, endIP string) chan string {

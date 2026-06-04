@@ -65,10 +65,15 @@ func scanTCP(addr string, timeout time.Duration) *ScanResult {
 	// Set read timeout
 	conn.SetReadDeadline(time.Now().Add(timeout))
 
-	// Send HTTP probe for common HTTP ports
+	// Send an HTTP probe on every port that is NOT a known binary-first-speaker.
+	// SSH/SMTP/MySQL/Postgres/Mongo/Redis/RDP speak first or need a binary
+	// handshake, so an HTTP GET there is pointless; everything else (8123
+	// ClickHouse, 9200 Elasticsearch, 8030/8040 StarRocks, 8123, 9000, ...) is an
+	// HTTP API that only answers once probed. The old gate hit only 5 ports and
+	// so silently missed every HTTP data layer.
 	host := strings.Split(addr, ":")[0]
 	port := strings.Split(addr, ":")[1]
-	if port == "80" || port == "8000" || port == "8080" || port == "8081" || port == "8443" {
+	if !binaryFirstSpeaker(port) {
 		fmt.Fprintf(conn, "GET / HTTP/1.0\r\nHost: %s\r\n\r\n", host)
 	}
 
@@ -117,6 +122,16 @@ func scanTLS(addr string, timeout time.Duration) *ScanResult {
 			Expired:   time.Now().After(cert.NotAfter),
 		},
 	}
+}
+
+// binaryFirstSpeaker reports whether a port runs a protocol that speaks first or
+// needs a binary handshake, so an HTTP GET would be useless or harmful.
+func binaryFirstSpeaker(port string) bool {
+	switch port {
+	case "22", "25", "465", "587", "3306", "5432", "27017", "6379", "3389", "9042", "11211":
+		return true
+	}
+	return false
 }
 
 // parseBanner extracts version and OS info from banner text

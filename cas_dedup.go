@@ -3,74 +3,73 @@ package main
 import (
 	"hash/fnv"
 	"sync/atomic"
-	"time"
 )
 
-// CASDedup uses compare-and-swap for lock-free deduplication
-// Each entry is a uint64 timestamp of when the (IP:port:version) was first claimed
+// CASDedup is a lock-free deduplication set built on an open-addressed table of
+// 64-bit key hashes. Each slot holds a non-zero key hash (0 means empty). On
+// collision it linearly probes to the next slot, so two DISTINCT keys that hash
+// to the same start slot are never confused — the earlier implementation stored
+// only a timestamp with no key identity and silently dropped distinct keys that
+// collided. Claims use a single atomic compare-and-swap; no mutex, no queue.
 type CASDedup struct {
-	entries [2_000_000]uint64
+	entries []uint64
+	size    uint64
 }
 
-// NewCASDedup creates a new CAS deduplication map
+// NewCASDedup creates a dedup table with size slots (honored, unlike before).
 func NewCASDedup(size uint64) *CASDedup {
-	return &CASDedup{}
+	if size == 0 {
+		size = 2_000_000
+	}
+	return &CASDedup{entries: make([]uint64, size), size: size}
 }
 
-// TryClaim attempts to claim a dedup key using CAS
-// Returns true if this worker was first to claim it
-// Returns false if another worker already claimed it
+// TryClaim returns true if this call is the first to claim key, false if key was
+// already claimed. Distinct keys are never dropped: on a slot collision with a
+// different key it probes forward; only a genuine repeat of the same key, or a
+// full table, ends the probe.
 func (cd *CASDedup) TryClaim(key string) bool {
-	// Hash the key to an index
-	idx := cd.hashToIndex(key)
-
-	// Current timestamp (monotonic)
-	now := uint64(time.Now().UnixNano())
-
-	// Load current value
-	expected := atomic.LoadUint64(&cd.entries[idx])
-
-	// If slot is empty (0), we try to claim it
-	// If slot is occupied, we fail (another worker got it)
-	if expected == 0 {
-		// Try CAS: if still 0, set to now
-		success := atomic.CompareAndSwapUint64(
-			&cd.entries[idx],
-			0,       // expected
-			now,     // new value
-		)
-		return success
+	kh := keyHash(key)
+	start := kh % cd.size
+	for i := uint64(0); i < cd.size; i++ {
+		idx := (start + i) % cd.size
+		v := atomic.LoadUint64(&cd.entries[idx])
+		switch {
+		case v == kh:
+			return false // this exact key already claimed
+		case v == 0:
+			if atomic.CompareAndSwapUint64(&cd.entries[idx], 0, kh) {
+				return true // we claimed an empty slot
+			}
+			// lost the race for this slot; if the winner claimed OUR key, it is a
+			// duplicate, otherwise keep probing past the now-occupied slot.
+			if atomic.LoadUint64(&cd.entries[idx]) == kh {
+				return false
+			}
+		}
+		// occupied by a different key: probe the next slot
 	}
-
-	// Slot was already occupied
-	// However, handle hash collisions: if collision, check if timestamp is "old"
-	// If >1 hour old, allow re-claim (IP might be reused)
-	if now-expected > 3600*1e9 { // 1 hour in nanoseconds
-		success := atomic.CompareAndSwapUint64(
-			&cd.entries[idx],
-			expected,
-			now,
-		)
-		return success
-	}
-
-	return false
+	return true // table full: fail open (index it) rather than drop a real result
 }
 
-// hashToIndex converts a dedup key to an index in the entries array
-func (cd *CASDedup) hashToIndex(key string) uint32 {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return h.Sum32() % uint32(len(cd.entries))
-}
-
-// Stats returns the number of claimed entries (approximate)
+// Stats returns the number of claimed slots (approximate under concurrency).
 func (cd *CASDedup) Stats() int {
 	count := 0
-	for i := 0; i < len(cd.entries); i++ {
+	for i := range cd.entries {
 		if atomic.LoadUint64(&cd.entries[i]) != 0 {
 			count++
 		}
 	}
 	return count
+}
+
+// keyHash maps a key to a non-zero 64-bit hash (0 is reserved for empty slots).
+func keyHash(key string) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(key))
+	v := h.Sum64()
+	if v == 0 {
+		v = 1
+	}
+	return v
 }
