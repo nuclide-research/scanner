@@ -163,29 +163,98 @@ watch -n 86400 './shodan-clone --start=10.0.0.0 --end=10.255.255.255 --workers=1
 
 ## How It Works
 
-### Lock-Free Deduplication
-
-Each `IP:port:version` key goes through a two-stage dedup pipeline:
-
-1. **Bloom filter** — probabilistic membership check (16 MB, 256M capacity). Definitely-absent keys skip stage 2.
-2. **CAS map** — `atomic.CompareAndSwapUint64` on a 2M-slot array. First worker to claim a hash slot wins; others discard.
-
-Multiple goroutines contend only at the CAS level — no mutexes in the hot path.
-
-### Bloom Filter vs Naive Approach
+### Execution Flow
 
 ```
-Naive (1B IPs, all ports):
-├─ Mutex-locked set: 600 GB
-├─ Serialization bottleneck: 1,000 workers all waiting
-└─ Result: 99% CPU time in lock contention
-
-CAS + Bloom (same scale):
-├─ Bloom filter: 16 MB
-├─ CAS map: 32 MB
-├─ 98% bypass locks entirely
-└─ Result: Near-linear scaling to 1000+ workers
+main()
+  |
+  +- generateIPRange() / loadIPsFromFile() --> chan string (buffered 1000)
+  |                                                  |
+  |    +--------------------------------------------|
+  |    |  fan-out to N workers                       |
+  |    v                                             v
+  |  w-0  w-1  w-2  ...  w-99  (goroutines, default 100)
+  |    |
+  |    |  for each IP x 12 ports:
+  |    |
+  |    +-> net.DialTimeout()        TCP connect (3s timeout)
+  |    |       | success
+  |    |       v
+  |    +-> banner read + parseBanner()
+  |    |
+  |    |  dedup check:
+  |    +-> BloomFilter.Contains()   read-only, no lock
+  |    +-> CASDedup.TryClaim()      one atomic instruction
+  |    |       | winner
+  |    |       v
+  |    +-> Indexer.Send()           mutex-gated buffered write
+  |
+  +- stats ticker (every 5s)
 ```
+
+### Mechanism 1: Goroutine Fan-Out (why workers help)
+
+Every worker blocks independently on `net.DialTimeout`. Blocking in Go parks the goroutine and yields the OS thread — 100 workers blocked on network I/O consume essentially zero CPU while waiting. When a connection resolves, the scheduler wakes that goroutine immediately.
+
+```
+Single-threaded (serial):
+  [dial 3s][dial 3s][dial 3s] --> 3 checks in 9 seconds
+
+100 workers (parallel):
+  [dial][dial][dial]...(x100 in flight simultaneously)
+  --> 1200 checks in ~3 seconds (all timeouts fire together)
+```
+
+This is I/O parallelism, not CPU parallelism. The bottleneck is network latency, not cores.
+
+### Mechanism 2: Lock-Free Dedup (why workers don't block each other)
+
+With a mutex, every worker queues up to write "I've seen this key":
+
+```
+Mutex approach (1000 workers):
+  w-1: lock() -> write -> unlock()
+  w-2: [BLOCKED]
+  w-3: [BLOCKED]
+  ...
+  --> 99% of time spent waiting, not scanning
+```
+
+The scanner avoids this with two structures that require no mutex:
+
+**BloomFilter.Contains() — pure read:**
+```
+3 array reads -> return true/false
+No write, no lock, any number of workers simultaneously
+```
+
+**CASDedup.TryClaim() — single atomic instruction:**
+```go
+atomic.CompareAndSwapUint64(&slot, 0, now)
+// Winner: slot was 0, now owns it -> returns true
+// Loser:  slot already set         -> returns false immediately
+```
+The CPU handles contention in hardware — one locked memory bus operation,
+not a software lock. No thread ever sleeps, no queue, no scheduler involvement.
+
+### Real-World Throughput
+
+The 10k-50k scans/sec claim assumes most connections close fast:
+
+```
+Best case (LAN, fast RST):
+  100 workers x 1ms avg response  = ~100k checks/sec
+
+Real internet (mix of RST + timeout):
+  Closed ports respond in <5ms (RST)
+  Filtered ports burn the full 3s timeout
+  100 workers x ~200ms avg        = ~500 checks/sec effective
+```
+
+The scanner is fast against hosts that respond quickly. Against filtered hosts
+where all ports drop packets silently, every connection burns the full timeout
+and throughput collapses — which is why passive discovery (Shodan) to build
+the target list first is the correct workflow before running active scans.
 
 ## Legal & Ethical Notes
 
