@@ -20,7 +20,7 @@ func main() {
 	ipsFile := flag.String("ips-file", "", "File containing IPs to scan, one per line (skips # comments)")
 	workers := flag.Int("workers", 100, "Number of concurrent workers")
 	outputFile := flag.String("output", "scan_results.jsonl", "Output file for results")
-	portsFlag := flag.String("ports", "80,443,22,3306,5432,3389,8000,8080,8081,8123,9000,9042,9200,10000,27017,5984",
+	portsFlag := flag.String("ports", "80,443,22,3306,5432,3389,3567,8000,8080,8081,8123,9000,9042,9200,10000,27017,5984",
 		"comma-separated ports to scan (defaults cover web + common data layers)")
 	flag.Parse()
 
