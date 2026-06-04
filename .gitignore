@@ -1,4 +1,4 @@
 scanner
-*.jsonl
+/*.jsonl
 *.db
 __pycache__
