@@ -1,0 +1,4 @@
+scanner
+*.jsonl
+*.db
+__pycache__
