@@ -10,6 +10,35 @@ Go TCP/TLS banner scanner with lock-free deduplication (CAS + Bloom filter). Acc
 - **Elasticsearch integration**: Bulk indexing for searchable results
 - **REST API**: Shodan-style query syntax (port:80 country:US)
 
+## What it does in practice — field-validated
+
+Run as the **active-banner stage between passive discovery (Shodan/Censys) and deep enumeration**, on a
+real 3,362-host AI-infrastructure survey (Cat-02 vector databases, 2026-06-05):
+
+| metric | result |
+|---|---|
+| IPs scanned (from Shodan) | 3,362 |
+| Wall-clock | **~9 minutes** (533s) |
+| Probes | 94,136 full TCP+TLS handshakes (28 ports/host) |
+| Banners captured | 2,580 |
+| **Live-host rate** | **29%** — 71% of Shodan's cached IPs were dead/stale/moved |
+| Dork false-positives stripped | 122 (nginx/Cloudflare matched the dork but weren't the service) |
+| Shadow-port exposures surfaced | ~550 (Attu / MinIO / etcd / Prometheus / Docker-registry) |
+| Versions captured | live, per-host (e.g. Qdrant 1.13.4–1.17.1 for CVE scoping) |
+
+**The speed is the capability — but it's a different kind of fast than masscan.** masscan does millions
+of SYN/sec and tells you only *"port open."* This does the opposite: a full TCP+TLS handshake, banner
+read, and **version parse** on every probe, so the output is `Qdrant 1.17.0, here's the JSON`, not
+`port 6333 open`. At ~176 full-handshake probes/sec from a single box (congestion-controlled, over a
+VPN) it turned a raw 3,362-IP list into current, structured, FP-stripped intelligence in under 10 minutes.
+
+That throughput is exactly why it belongs *before* a heavy deep-enumeration tool. It's cheap enough to
+run on the entire raw passive-discovery list, so the expensive stage only ever touches the ~29% that are
+actually live — already FP-stripped, with versions and shadow ports pre-identified. Three load-bearing
+jobs in one pass: **liveness, fresh version, and dork-FP strip.**
+
+Full PoC writeup + raw evidence: [`results/poc-cat02-vectordb-2026-06-05.md`](results/poc-cat02-vectordb-2026-06-05.md).
+
 ## Components
 
 ### Core Files
